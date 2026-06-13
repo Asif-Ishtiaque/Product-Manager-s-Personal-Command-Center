@@ -13,8 +13,18 @@ JIRA_POINTS_FIELD=
 FIGMA_TOKEN=your-figma-personal-access-token
 FIGMA_FILES=ABC123xyz,DEF456uvw
 
+# optional — ClickUp (scaffolded). Leave blank to keep dormant.
+# Token: ClickUp → Settings → Apps → API Token (pk_...). Team id is in the URL.
+CLICKUP_TOKEN=
+CLICKUP_TEAM=
+
+# optional — Slack (scaffolded). Leave blank to keep dormant.
+# User/bot token (xoxp-/xoxb-) with search:read for mentions.
+SLACK_TOKEN=
+
 # optional — restrict who can read the proxy (defaults to *)
 ALLOW_ORIGIN=*
 
-# Login access token — anyone who opens the dashboard must enter this to unlock it
-ACCESS_TOKEN=your-secret-dashboard-password
+# optional — Bearer token gate on the proxy. The dashboard's passwordless
+# login is client-side; set this if you also want to lock the proxy itself.
+ACCESS_TOKEN=
