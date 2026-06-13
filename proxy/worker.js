@@ -14,7 +14,14 @@
      JIRA_POINTS_FIELD(optional) e.g. customfield_10016 (story points)
      FIGMA_TOKEN      Figma personal access token
      FIGMA_FILES      comma-separated file keys, e.g. abc123,def456
+     CLICKUP_TOKEN    (optional) ClickUp personal API token (pk_...)
+     CLICKUP_TEAM     (optional) ClickUp team/workspace id
+     SLACK_TOKEN      (optional) Slack user/bot token (xoxp-/xoxb-...)
      ALLOW_ORIGIN     (optional) your dashboard origin, default "*"
+
+   ClickUp + Slack are SCAFFOLDED: the fetchers below are wired to the
+   real APIs but stay dormant until their tokens are present, so the
+   board still works on Jira + Figma alone. Add the tokens to go live.
    ============================================================ */
 
 export default {
@@ -30,14 +37,22 @@ export default {
       }
     }
 
-    // Run both sources independently so one failure can't blank the board.
-    const [jira, figma] = await Promise.all([
+    // Run every source independently so one failure can't blank the board.
+    // ClickUp + Slack short-circuit to empty when their tokens are absent.
+    const [jira, figma, clickup, slack] = await Promise.all([
       getJira(env).catch(e => ({ error: String(e) })),
       getFigma(env).catch(e => ({ error: String(e) })),
+      getClickUp(env).catch(e => ({ error: String(e) })),
+      getSlack(env).catch(e => ({ error: String(e) })),
     ]);
 
-    const payload = normalize(jira, figma);
-    payload._errors = [jira.error, figma.error].filter(Boolean);
+    const payload = normalize(jira, figma, clickup, slack);
+    payload._errors = [jira.error, figma.error, clickup.error, slack.error].filter(Boolean);
+    payload._connected = {
+      jira: !jira.error, figma: !figma.error,
+      clickup: !!env.CLICKUP_TOKEN && !clickup.error,
+      slack: !!env.SLACK_TOKEN && !slack.error,
+    };
     return cors(env, json(payload));
   }
 };
@@ -144,11 +159,74 @@ async function getFigma(env) {
   return { updates, comments };
 }
 
+/* ---------------- CLICKUP (scaffold) ----------------
+   Dormant until CLICKUP_TOKEN + CLICKUP_TEAM are set. Pulls tasks
+   assigned to you that are open and due soon. Shape mirrors what the
+   dashboard's attention feed expects (see normalize → clickup items). */
+async function getClickUp(env) {
+  if (!env.CLICKUP_TOKEN || !env.CLICKUP_TEAM) return { tasks: [] };
+  const H = { 'Authorization': env.CLICKUP_TOKEN, 'Accept': 'application/json' };
+
+  // Identify "me" so we can filter to my assignments.
+  const me = await fetch('https://api.clickup.com/api/v2/user', { headers: H }).then(r => r.json()).catch(() => ({}));
+  const myId = me?.user?.id;
+
+  // Open tasks across the workspace, narrowed to me, ordered by due date.
+  const params = new URLSearchParams({ order_by: 'due_date', subtasks: 'true', include_closed: 'false' });
+  if (myId) params.append('assignees[]', String(myId));
+  const res = await fetch(`https://api.clickup.com/api/v2/team/${env.CLICKUP_TEAM}/task?${params}`, { headers: H });
+  if (!res.ok) throw new Error(`ClickUp ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+
+  const tasks = (data.tasks || []).map(t => ({
+    id: t.id,
+    name: t.name,
+    status: t.status?.status || '',
+    url: t.url,
+    due: t.due_date ? new Date(Number(t.due_date)).toISOString() : null,
+    updated: t.date_updated ? new Date(Number(t.date_updated)).toISOString() : null,
+    list: t.list?.name || '',
+    priority: t.priority?.priority || null, // 'urgent' | 'high' | 'normal' | 'low'
+  }));
+  return { tasks };
+}
+
+/* ---------------- SLACK (scaffold) ----------------
+   Dormant until SLACK_TOKEN is set. Pulls unread mentions/threads
+   needing a reply. Uses search.messages (requires search:read) and
+   falls back gracefully if scopes are missing. */
+async function getSlack(env) {
+  if (!env.SLACK_TOKEN) return { mentions: [] };
+  const H = { 'Authorization': `Bearer ${env.SLACK_TOKEN}`, 'Accept': 'application/json' };
+
+  // Who am I, so we can search for mentions of my handle.
+  const auth = await fetch('https://slack.com/api/auth.test', { headers: H }).then(r => r.json()).catch(() => ({}));
+  if (!auth.ok) throw new Error(`Slack auth: ${auth.error || 'unknown'}`);
+
+  // Messages that mention me, newest first.
+  const q = encodeURIComponent('is:unread to:me OR @' + (auth.user || ''));
+  const res = await fetch(`https://slack.com/api/search.messages?query=${q}&count=15&sort=timestamp`, { headers: H });
+  const data = await res.json();
+  if (!data.ok) throw new Error(`Slack search: ${data.error || 'unknown'}`);
+
+  const mentions = (data.messages?.matches || []).map(m => ({
+    id: m.iid || m.ts,
+    channel: m.channel?.name ? '#' + m.channel.name : 'DM',
+    author: m.username || m.user || 'someone',
+    text: m.text || '',
+    url: m.permalink,
+    ts: m.ts ? new Date(Number(m.ts) * 1000).toISOString() : null,
+  }));
+  return { mentions };
+}
+
 /* ---------------- NORMALIZE → dashboard shape ---------------- */
-function normalize(jira, figma) {
-  jira = jira || {}; figma = figma || {};
+function normalize(jira, figma, clickup, slack) {
+  jira = jira || {}; figma = figma || {}; clickup = clickup || {}; slack = slack || {};
   const J = jira.blockers ? jira : { blockers: [], wip: [], review: [], dueSoon: [], pulse: [], sprint: null };
   const Fg = figma.updates ? figma : { updates: [], comments: [] };
+  const Cu = clickup.tasks ? clickup : { tasks: [] };
+  const Sl = slack.mentions ? slack : { mentions: [] };
 
   // ---- metrics ----
   const metrics = [];
@@ -162,15 +240,17 @@ function normalize(jira, figma) {
   const figmaMentions = Fg.comments.filter(c => c.mentionsMe).length;
   metrics.push({ label: 'In Review', val: String(J.review.length), sub: '', meta: `${figmaMentions} design mention${figmaMentions === 1 ? '' : 's'}`, accent: 'var(--violet)' });
 
-  // ---- attention feed (unified, sorted) ----
+  // ---- attention feed (unified across all sources, sorted) ----
   const attention = [];
   for (const it of J.blockers) attention.push(mapIssue(it, 'p0', 'blocked'));
   for (const c of Fg.comments.filter(c => c.mentionsMe)) attention.push(mapComment(c, 'p0', 'mention'));
   for (const it of J.dueSoon) attention.push(mapIssue(it, isOverdue(it) ? 'p0' : 'p1', null));
   for (const it of J.review) attention.push(mapIssue(it, 'p1', 'review'));
+  for (const t of Cu.tasks) attention.push(mapTask(t));
+  for (const m of Sl.mentions) attention.push(mapMention(m));
   for (const c of Fg.comments.filter(c => !c.mentionsMe).slice(0, 3)) attention.push(mapComment(c, 'p2', null));
   attention.sort((a, b) => a.pri.localeCompare(b.pri));
-  const attn = attention.slice(0, 9);
+  const attn = attention.slice(0, 14);
 
   // ---- sprint widget ----
   const sprint = J.sprint
@@ -194,13 +274,17 @@ function normalize(jira, figma) {
   return { metrics, attention: attn, sprint, jira: jiraFeed, figma: figmaFeed };
 }
 
-/* ---------------- mappers + helpers ---------------- */
+/* ---------------- mappers + helpers ----------------
+   Each attention item carries updatedISO/dueISO so the dashboard can
+   compute staleness + SLA flags client-side (shared with My Day). */
 function mapIssue(it, pri, chip) {
   return {
     src: 'jira', pri, key: it.key,
     title: esc(it.fields.summary || ''),
     desc: `${it.fields.issuetype?.name || 'Issue'} · ${it.fields.status?.name || ''}${it.fields.duedate ? ' · due ' + it.fields.duedate : ''}`,
     chip, when: ago(it.fields.updated),
+    updatedISO: it.fields.updated || null,
+    dueISO: it.fields.duedate || null,
   };
 }
 function mapComment(c, pri, chip) {
@@ -209,6 +293,27 @@ function mapComment(c, pri, chip) {
     title: esc(trunc(c.message, 80)) || 'New comment',
     desc: `${c.author} commented`,
     chip, when: ago(c.created_at),
+    updatedISO: c.created_at || null, dueISO: null,
+  };
+}
+function mapTask(t) {
+  const overdue = t.due && new Date(t.due) < new Date();
+  const pri = t.priority === 'urgent' || overdue ? 'p0' : t.priority === 'high' ? 'p1' : 'p2';
+  return {
+    src: 'clickup', pri, key: trunc(t.list || 'Task', 18),
+    title: esc(trunc(t.name, 80)),
+    desc: `${t.status || 'open'}${t.due ? ' · due ' + t.due.slice(0, 10) : ''}`,
+    chip: overdue ? 'overdue' : 'due', when: ago(t.updated),
+    updatedISO: t.updated || null, dueISO: t.due || null,
+  };
+}
+function mapMention(m) {
+  return {
+    src: 'slack', pri: 'p1', key: trunc(m.channel, 18),
+    title: esc(trunc(m.text, 80)) || 'New message',
+    desc: `${m.author} mentioned you`,
+    chip: 'reply', when: ago(m.ts),
+    updatedISO: m.ts || null, dueISO: null,
   };
 }
 const isOverdue = it => it.fields.duedate && new Date(it.fields.duedate) < new Date();
