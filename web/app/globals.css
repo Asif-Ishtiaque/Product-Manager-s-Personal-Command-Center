@@ -107,3 +107,11 @@ body {
 .note { font-size: 12px; color: var(--text-dim); margin-top: 18px; }
 .banner { display: flex; align-items: center; gap: 10px; background: rgba(94, 201, 138, 0.08); border: 1px solid rgba(94, 201, 138, 0.25); color: var(--green); border-radius: 10px; padding: 10px 14px; font-size: 12.5px; margin-bottom: 16px; }
 .banner.err { background: rgba(232, 104, 95, 0.08); border-color: rgba(232, 104, 95, 0.25); color: var(--red); }
+
+.connect-strip { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.connect-label { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); margin-right: 4px; }
+.connect-jira:hover { border-color: var(--blue); color: var(--blue); }
+.connect-figma:hover { border-color: var(--violet); color: var(--violet); }
+.connect-clickup:hover { border-color: var(--pink); color: var(--pink); }
+.connect-slack:hover { border-color: var(--sky); color: var(--sky); }
+.connect-notion:hover { border-color: var(--text); color: var(--text); }

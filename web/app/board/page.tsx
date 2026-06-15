@@ -1,6 +1,8 @@
 import { auth, signOut } from "@/auth";
 import { prisma } from "@/lib/prisma";
 import { slaFlag, urgency, ago } from "@/lib/sla";
+import { integrations } from "@/lib/integrations/registry";
+import { SOURCES } from "@/lib/integrations/types";
 import { redirect } from "next/navigation";
 import RefreshButton from "./RefreshButton";
 
@@ -21,7 +23,8 @@ export default async function BoardPage({
   ]);
 
   const sorted = items.sort((a, b) => urgency(a) - urgency(b));
-  const notionConnected = connections.some((c) => c.source === "notion");
+  const connectedSet = new Set(connections.map((c) => c.source));
+  const unconnected = SOURCES.filter((s) => !connectedSet.has(s));
 
   async function logout() {
     "use server";
@@ -39,9 +42,6 @@ export default async function BoardPage({
         </div>
         <div className="bar-actions">
           <span className="who">{session.user.email}</span>
-          {!notionConnected && (
-            <a className="btn amber" href="/api/connect/notion">+ Connect Notion</a>
-          )}
           <RefreshButton />
           <form action={logout}>
             <button type="submit" className="btn">Log out</button>
@@ -49,8 +49,21 @@ export default async function BoardPage({
         </div>
       </div>
 
-      {connected === "notion" && <div className="banner">✓ Notion connected — your pages are syncing into the feed.</div>}
+      {connected && integrations[connected as keyof typeof integrations] && (
+        <div className="banner">✓ {integrations[connected as keyof typeof integrations].label} connected — syncing into your feed.</div>
+      )}
       {error && <div className="banner err">Something went wrong ({error}). Try connecting again.</div>}
+
+      {unconnected.length > 0 && (
+        <div className="connect-strip">
+          <span className="connect-label">Connect a source:</span>
+          {unconnected.map((s) => (
+            <a key={s} className={`btn connect-${s}`} href={`/api/connect/${s}`}>
+              + {integrations[s].label}
+            </a>
+          ))}
+        </div>
+      )}
 
       <section className="panel">
         <div className="head">
@@ -60,10 +73,10 @@ export default async function BoardPage({
 
         {sorted.length === 0 ? (
           <div className="empty">
-            {notionConnected ? (
-              <>No items yet. Hit <b>↻ Sync</b> to pull from Notion.</>
+            {connections.length > 0 ? (
+              <>No items yet. Hit <b>↻ Sync</b> to pull from your connected tools.</>
             ) : (
-              <>Nothing here yet. <br /> Connect Notion to populate your attention feed.</>
+              <>Nothing here yet. <br /> Connect a source above to populate your attention feed.</>
             )}
           </div>
         ) : (
