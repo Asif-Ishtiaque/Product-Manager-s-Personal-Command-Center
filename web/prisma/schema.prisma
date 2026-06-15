@@ -1,0 +1,142 @@
+// Tide — production data model
+// Auth.js (NextAuth) models + Tide domain models.
+// Tokens for connected tools are stored ENCRYPTED (AES-256-GCM) in
+// Connection.accessTokenEnc / refreshTokenEnc — never in plaintext.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/* ---------------- Auth.js core ---------------- */
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  createdAt     DateTime  @default(now())
+
+  accounts    Account[]
+  sessions    Session[]
+  connections Connection[]
+  items       Item[]
+  links       CrossLink[]
+}
+
+// OAuth identities used to LOG IN to Tide (e.g. Google). Distinct from
+// Connection, which holds the tools the user links AFTER logging in.
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+/* ---------------- Tide domain ---------------- */
+
+enum Source {
+  jira
+  figma
+  clickup
+  slack
+  notion
+}
+
+// A tool the user has connected via OAuth. One row per (user, source).
+// Access/refresh tokens are encrypted at rest.
+model Connection {
+  id                String    @id @default(cuid())
+  userId            String
+  source            Source
+  externalAccountId String? // workspace / team / bot id from the provider
+  workspaceName     String?
+  accessTokenEnc    String    @db.Text
+  refreshTokenEnc   String?   @db.Text
+  expiresAt         DateTime?
+  scope             String?
+  createdAt         DateTime  @default(now())
+  lastSyncedAt      DateTime?
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items Item[]
+
+  @@unique([userId, source])
+}
+
+// A normalized unit of attention synced from a source. The board reads
+// from here so it loads instantly without hitting every API live.
+model Item {
+  id              String    @id @default(cuid())
+  userId          String
+  connectionId    String
+  source          Source
+  externalId      String // stable id from the provider
+  title           String
+  description     String?   @db.Text
+  url             String?
+  priority        String    @default("p2") // p0 | p1 | p2
+  status          String?
+  chip            String?
+  dueAt           DateTime?
+  updatedAtSource DateTime?
+  raw             Json? // original payload for debugging / future fields
+  createdAt       DateTime  @default(now())
+
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  connection Connection @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  links      CrossLink[]
+
+  @@unique([userId, source, externalId])
+  @@index([userId])
+}
+
+// The differentiator: attach context from another tool onto an item.
+model CrossLink {
+  id           String   @id @default(cuid())
+  userId       String
+  itemId       String
+  linkedSource Source
+  linkedLabel  String
+  linkedUrl    String?
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  item Item @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@index([itemId])
+}

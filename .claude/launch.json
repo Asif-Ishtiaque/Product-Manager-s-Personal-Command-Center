@@ -6,6 +6,14 @@
       "runtimeExecutable": "npx",
       "runtimeArgs": ["-y", "serve", "dashboard", "-l", "5050"],
       "port": 5050
+    },
+    {
+      "name": "web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev"],
+      "port": 3000,
+      "autoPort": true,
+      "cwd": "web"
     }
   ]
 }
