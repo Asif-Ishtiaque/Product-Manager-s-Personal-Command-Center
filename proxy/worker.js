@@ -28,32 +28,322 @@ export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') return cors(env, new Response(null, { status: 204 }));
 
-    // Token authentication check
-    if (env.ACCESS_TOKEN) {
-      const auth = request.headers.get('Authorization');
-      const token = auth && auth.replace(/^Bearer /, '').trim();
-      if (token !== env.ACCESS_TOKEN) {
-        return cors(env, json({ error: 'Unauthorized' }, 401));
+    const url = new URL(request.url);
+    const path = url.pathname;
+    const method = request.method;
+
+    const encryptionSecret = env.ENCRYPTION_KEY || 'tide-local-dev-encryption-key-32chars';
+
+    // 1. Passwordless login link generation
+    if (path === '/api/auth/login' && method === 'POST') {
+      try {
+        const { email } = await request.json();
+        if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+          return cors(env, json({ error: 'Invalid email address' }, 400));
+        }
+
+        // Insert user if not exists
+        await env.DB.prepare(
+          "INSERT OR IGNORE INTO users (email) VALUES (?)"
+        ).bind(email).run();
+
+        // Generate verification token
+        const token = crypto.randomUUID();
+        const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString(); // 15 mins
+
+        await env.DB.prepare(
+          "INSERT INTO login_tokens (email, token, expires_at) VALUES (?, ?, ?)"
+        ).bind(email, token, expiresAt).run();
+
+        // Magic link points to frontend index.html with query parameter
+        const frontendUrl = env.FRONTEND_URL || `http://localhost:${env.PORT || 3000}`;
+        const magicLink = `${frontendUrl}/?login_token=${token}`;
+
+        return cors(env, json({ success: true, magicLink }));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
       }
     }
 
-    // Run every source independently so one failure can't blank the board.
-    // ClickUp + Slack short-circuit to empty when their tokens are absent.
-    const [jira, figma, clickup, slack] = await Promise.all([
-      getJira(env).catch(e => ({ error: String(e) })),
-      getFigma(env).catch(e => ({ error: String(e) })),
-      getClickUp(env).catch(e => ({ error: String(e) })),
-      getSlack(env).catch(e => ({ error: String(e) })),
-    ]);
+    // 2. Magic link verification
+    if (path === '/api/auth/verify' && method === 'POST') {
+      try {
+        const { token } = await request.json();
+        if (!token) return cors(env, json({ error: 'Token is required' }, 400));
 
-    const payload = normalize(jira, figma, clickup, slack);
-    payload._errors = [jira.error, figma.error, clickup.error, slack.error].filter(Boolean);
-    payload._connected = {
-      jira: !jira.error, figma: !figma.error,
-      clickup: !!env.CLICKUP_TOKEN && !clickup.error,
-      slack: !!env.SLACK_TOKEN && !slack.error,
-    };
-    return cors(env, json(payload));
+        const now = new Date().toISOString();
+        const pendingToken = await env.DB.prepare(
+          "SELECT * FROM login_tokens WHERE token = ? AND expires_at > ?"
+        ).bind(token, now).first();
+
+        if (!pendingToken) {
+          return cors(env, json({ error: 'Invalid or expired magic link' }, 400));
+        }
+
+        const email = pendingToken.email;
+
+        // Clean up verification token
+        await env.DB.prepare(
+          "DELETE FROM login_tokens WHERE token = ?"
+        ).bind(token).run();
+
+        // Retrieve user
+        const user = await env.DB.prepare(
+          "SELECT id, email FROM users WHERE email = ?"
+        ).bind(email).first();
+
+        if (!user) {
+          return cors(env, json({ error: 'User not found' }, 404));
+        }
+
+        // Create user session (30 days)
+        const sessionToken = crypto.randomUUID();
+        const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+        await env.DB.prepare(
+          "INSERT INTO sessions (user_id, token, expires_at) VALUES (?, ?, ?)"
+        ).bind(user.id, sessionToken, expiresAt).run();
+
+        return cors(env, json({ success: true, token: sessionToken, email }));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
+      }
+    }
+
+    // 3. Logout
+    if (path === '/api/auth/logout' && method === 'POST') {
+      try {
+        const auth = request.headers.get('Authorization');
+        const token = auth && auth.replace(/^Bearer /, '').trim();
+        if (token) {
+          await env.DB.prepare("DELETE FROM sessions WHERE token = ?").bind(token).run();
+        }
+        return cors(env, json({ success: true }));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
+      }
+    }
+
+    // --- Authentication Barrier ---
+    // All endpoints below this point require a valid session_token
+    const authHeader = request.headers.get('Authorization');
+    const sessionToken = authHeader && authHeader.replace(/^Bearer /, '').trim();
+    if (!sessionToken) {
+      return cors(env, json({ error: 'Authorization required' }, 401));
+    }
+
+    const now = new Date().toISOString();
+    const user = await env.DB.prepare(
+      "SELECT u.id, u.email FROM sessions s JOIN users u ON s.user_id = u.id WHERE s.token = ? AND s.expires_at > ?"
+    ).bind(sessionToken, now).first();
+
+    if (!user) {
+      return cors(env, json({ error: 'Invalid or expired session' }, 401));
+    }
+
+    // 4. Integrations API: Get settings
+    if (path === '/api/integrations' && method === 'GET') {
+      try {
+        const row = await env.DB.prepare(
+          "SELECT * FROM integrations WHERE user_id = ?"
+        ).bind(user.id).first();
+
+        const config = {
+          JIRA_SITE: '', JIRA_EMAIL: '', JIRA_TOKEN: '', JIRA_PROJECT: '',
+          JIRA_BOARD_ID: '', JIRA_POINTS_FIELD: '',
+          FIGMA_TOKEN: '', FIGMA_FILES: '',
+          CLICKUP_TOKEN: '', CLICKUP_TEAM: '',
+          SLACK_TOKEN: ''
+        };
+
+        if (row) {
+          config.JIRA_SITE = row.jira_site || '';
+          config.JIRA_EMAIL = row.jira_email || '';
+          config.JIRA_TOKEN = row.jira_token ? '********' : '';
+          config.JIRA_PROJECT = row.jira_project || '';
+          config.JIRA_BOARD_ID = row.jira_board_id || '';
+          config.JIRA_POINTS_FIELD = row.jira_points_field || '';
+          config.FIGMA_TOKEN = row.figma_token ? '********' : '';
+          config.FIGMA_FILES = row.figma_files || '';
+          config.CLICKUP_TOKEN = row.clickup_token ? '********' : '';
+          config.CLICKUP_TEAM = row.clickup_team || '';
+          config.SLACK_TOKEN = row.slack_token ? '********' : '';
+        }
+
+        return cors(env, json({ success: true, integrations: config }));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
+      }
+    }
+
+    // 5. Integrations API: Save settings
+    if (path === '/api/integrations' && method === 'POST') {
+      try {
+        const { keys } = await request.json();
+        if (!keys) return cors(env, json({ error: 'Keys are required' }, 400));
+
+        // Get existing integrations so we don't overwrite masked tokens
+        const existing = await env.DB.prepare(
+          "SELECT * FROM integrations WHERE user_id = ?"
+        ).bind(user.id).first();
+
+        // Helper to process token field
+        const processToken = async (newVal, dbVal) => {
+          if (newVal === '********') return dbVal; // keep current database value
+          if (!newVal) return null; // delete key
+          return await encrypt(newVal, encryptionSecret); // encrypt new key
+        };
+
+        const jiraSite = keys.JIRA_SITE || null;
+        const jiraEmail = keys.JIRA_EMAIL || null;
+        const jiraToken = await processToken(keys.JIRA_TOKEN, existing?.jira_token);
+        const jiraProject = keys.JIRA_PROJECT || null;
+        const jiraBoardId = keys.JIRA_BOARD_ID || null;
+        const jiraPointsField = keys.JIRA_POINTS_FIELD || null;
+        const figmaToken = await processToken(keys.FIGMA_TOKEN, existing?.figma_token);
+        const figmaFiles = keys.FIGMA_FILES || null;
+        const clickupToken = await processToken(keys.CLICKUP_TOKEN, existing?.clickup_token);
+        const clickupTeam = keys.CLICKUP_TEAM || null;
+        const slackToken = await processToken(keys.SLACK_TOKEN, existing?.slack_token);
+
+        await env.DB.prepare(`
+          INSERT INTO integrations (
+            user_id, jira_site, jira_email, jira_token, jira_project, jira_board_id, jira_points_field,
+            figma_token, figma_files, clickup_token, clickup_team, slack_token, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, DATETIME('now'))
+          ON CONFLICT(user_id) DO UPDATE SET
+            jira_site=excluded.jira_site,
+            jira_email=excluded.jira_email,
+            jira_token=excluded.jira_token,
+            jira_project=excluded.jira_project,
+            jira_board_id=excluded.jira_board_id,
+            jira_points_field=excluded.jira_points_field,
+            figma_token=excluded.figma_token,
+            figma_files=excluded.figma_files,
+            clickup_token=excluded.clickup_token,
+            clickup_team=excluded.clickup_team,
+            slack_token=excluded.slack_token,
+            updated_at=DATETIME('now')
+        `).bind(
+          user.id, jiraSite, jiraEmail, jiraToken, jiraProject, jiraBoardId, jiraPointsField,
+          figmaToken, figmaFiles, clickupToken, clickupTeam, slackToken
+        ).run();
+
+        return cors(env, json({ success: true }));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
+      }
+    }
+
+    // 6. Test Integrations connection dynamically
+    if (path === '/api/integrations/test' && method === 'POST') {
+      try {
+        const { integrationId, keys } = await request.json();
+        if (!integrationId || !keys) {
+          return cors(env, json({ error: 'integrationId and keys are required' }, 400));
+        }
+
+        // If a token in keys is masked, fetch the existing stored token from DB to test with
+        const existing = await env.DB.prepare(
+          "SELECT * FROM integrations WHERE user_id = ?"
+        ).bind(user.id).first();
+
+        const resolveToken = async (newVal, dbValEnc) => {
+          if (newVal === '********') {
+            if (!dbValEnc) return null;
+            return await decrypt(dbValEnc, encryptionSecret);
+          }
+          return newVal || null;
+        };
+
+        const testKeys = { ...keys };
+        if (integrationId === 'jira') {
+          testKeys.JIRA_TOKEN = await resolveToken(keys.JIRA_TOKEN, existing?.jira_token);
+        } else if (integrationId === 'figma') {
+          testKeys.FIGMA_TOKEN = await resolveToken(keys.FIGMA_TOKEN, existing?.figma_token);
+        } else if (integrationId === 'clickup') {
+          testKeys.CLICKUP_TOKEN = await resolveToken(keys.CLICKUP_TOKEN, existing?.clickup_token);
+        } else if (integrationId === 'slack') {
+          testKeys.SLACK_TOKEN = await resolveToken(keys.SLACK_TOKEN, existing?.slack_token);
+        }
+
+        // Run connection test
+        let result;
+        if (integrationId === 'jira') {
+          result = await getJira(testKeys);
+        } else if (integrationId === 'figma') {
+          result = await getFigma(testKeys);
+        } else if (integrationId === 'clickup') {
+          result = await getClickUp(testKeys);
+        } else if (integrationId === 'slack') {
+          result = await getSlack(testKeys);
+        } else {
+          return cors(env, json({ error: 'Unknown integrationId' }, 400));
+        }
+
+        if (result.error) {
+          return cors(env, json({ success: false, error: result.error }));
+        }
+        return cors(env, json({ success: true }));
+      } catch (err) {
+        return cors(env, json({ success: false, error: err.message }));
+      }
+    }
+
+    // 7. Get user unified dashboard data
+    if ((path === '/' || path === '/api/dashboard') && method === 'GET') {
+      try {
+        const row = await env.DB.prepare(
+          "SELECT * FROM integrations WHERE user_id = ?"
+        ).bind(user.id).first();
+
+        // If no integration setup is found, return empty structures
+        if (!row) {
+          const payload = normalize(null, null, null, null);
+          payload._errors = [];
+          payload._connected = { jira: false, figma: false, clickup: false, slack: false };
+          return cors(env, json(payload));
+        }
+
+        // Decrypt keys
+        const userEnv = {
+          JIRA_SITE: row.jira_site || '',
+          JIRA_EMAIL: row.jira_email || '',
+          JIRA_TOKEN: row.jira_token ? await decrypt(row.jira_token, encryptionSecret) : '',
+          JIRA_PROJECT: row.jira_project || '',
+          JIRA_BOARD_ID: row.jira_board_id || '',
+          JIRA_POINTS_FIELD: row.jira_points_field || '',
+          FIGMA_TOKEN: row.figma_token ? await decrypt(row.figma_token, encryptionSecret) : '',
+          FIGMA_FILES: row.figma_files || '',
+          CLICKUP_TOKEN: row.clickup_token ? await decrypt(row.clickup_token, encryptionSecret) : '',
+          CLICKUP_TEAM: row.clickup_team || '',
+          SLACK_TOKEN: row.slack_token ? await decrypt(row.slack_token, encryptionSecret) : '',
+        };
+
+        // Fetch user data
+        const [jira, figma, clickup, slack] = await Promise.all([
+          getJira(userEnv).catch(e => ({ error: String(e) })),
+          getFigma(userEnv).catch(e => ({ error: String(e) })),
+          getClickUp(userEnv).catch(e => ({ error: String(e) })),
+          getSlack(userEnv).catch(e => ({ error: String(e) })),
+        ]);
+
+        const payload = normalize(jira, figma, clickup, slack);
+        payload._errors = [jira.error, figma.error, clickup.error, slack.error].filter(Boolean);
+        payload._connected = {
+          jira: !!userEnv.JIRA_TOKEN && !jira.error,
+          figma: !!userEnv.FIGMA_TOKEN && !figma.error,
+          clickup: !!userEnv.CLICKUP_TOKEN && !clickup.error,
+          slack: !!userEnv.SLACK_TOKEN && !slack.error,
+        };
+        return cors(env, json(payload));
+      } catch (err) {
+        return cors(env, json({ error: err.message }, 500));
+      }
+    }
+
+    // Default 404
+    return cors(env, json({ error: 'Not Found' }, 404));
   }
 };
 
@@ -334,7 +624,80 @@ function json(obj, status = 200) { return new Response(JSON.stringify(obj), { st
 function cors(env, res) {
   const h = new Headers(res.headers);
   h.set('Access-Control-Allow-Origin', env.ALLOW_ORIGIN || '*');
-  h.set('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  h.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   h.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   return new Response(res.body, { status: res.status, headers: h });
 }
+
+/* ---------------- CRYPTO HELPERS ---------------- */
+const ENCRYPTION_ALGO = 'AES-GCM';
+
+async function getCryptoKey(secret) {
+  const enc = new TextEncoder();
+  const paddedSecret = secret.padEnd(32, '0').slice(0, 32);
+  const rawKey = enc.encode(paddedSecret);
+  return crypto.subtle.importKey(
+    'raw',
+    rawKey,
+    { name: ENCRYPTION_ALGO },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+async function encrypt(text, secret) {
+  if (!text) return null;
+  const key = await getCryptoKey(secret);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const enc = new TextEncoder();
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: ENCRYPTION_ALGO, iv },
+    key,
+    enc.encode(text)
+  );
+  const combined = new Uint8Array(iv.length + ciphertext.byteLength);
+  combined.set(iv);
+  combined.set(new Uint8Array(ciphertext), iv.length);
+  return arrayBufferToBase64(combined.buffer);
+}
+
+async function decrypt(encryptedBase64, secret) {
+  if (!encryptedBase64) return null;
+  try {
+    const key = await getCryptoKey(secret);
+    const combined = new Uint8Array(base64ToArrayBuffer(encryptedBase64));
+    const iv = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const decrypted = await crypto.subtle.decrypt(
+      { name: ENCRYPTION_ALGO, iv },
+      key,
+      ciphertext
+    );
+    const dec = new TextDecoder();
+    return dec.decode(decrypted);
+  } catch (e) {
+    console.error('Decryption failed:', e);
+    return null;
+  }
+}
+
+function arrayBufferToBase64(buffer) {
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function base64ToArrayBuffer(base64) {
+  const binary_string = atob(base64);
+  const len = binary_string.length;
+  const bytes = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    bytes[i] = binary_string.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+

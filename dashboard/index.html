@@ -1516,7 +1516,8 @@
         deployed setup, the real secrets live in the Cloudflare Worker — never shipped to the browser.</span>
     </div>
     <div class="set-list" id="set-list"></div>
-    <div class="set-actions">
+    <div class="set-actions" style="gap:10px; display:flex;">
+      <button class="btn ghost" id="set-logout" style="color:var(--red); border-color:rgba(232,104,95,0.3);">Sign out</button>
       <button class="btn ghost" id="set-demo" style="flex:.6">Use demo data</button>
       <button class="btn" id="set-save">Save &amp; go to board</button>
     </div>
@@ -1535,13 +1536,14 @@
      /auth/verify and store it in KV — the UI states already match.
      ============================================================ */
   const CONFIG = {
-    proxyUrl: 'http://localhost:8787',
+    proxyUrl: 'http://localhost:8788',
     refreshMs: 60000,
   };
 
   /* ---------- local persistence (no secrets stored here) ---------- */
   const LS = {
     session: 'tide_session',       // signed-in email (or "demo")
+    sessionToken: 'tide_session_token', // D1 authentication token
     mode: 'tide_mode',             // 'demo' | 'live'
     conns: 'tide_connections',     // which integrations the user marked connected
     links: 'tide_links',           // cross-tool attachments keyed by card key
@@ -1556,6 +1558,7 @@
   let STATE = {
     mode: store.get(LS.mode, null),
     session: store.get(LS.session, null),
+    sessionToken: store.get(LS.sessionToken, null),
     view: 'all',                       // 'all' | 'myday'
     src: 'all',                        // 'all' | 'jira' | 'figma' | 'clickup' | 'slack'
     links: store.get(LS.links, {}),    // { 'PAY-412': [{src,label,url}], ... }
@@ -1610,7 +1613,20 @@
      ============================================================ */
   async function getData() {
     if (STATE.mode === 'live') {
-      const r = await fetch(CONFIG.proxyUrl, { headers: { 'Accept': 'application/json' } });
+      if (!STATE.sessionToken) {
+        logout();
+        throw new Error('No session token');
+      }
+      const r = await fetch(`${CONFIG.proxyUrl}/api/dashboard`, {
+        headers: { 
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${STATE.sessionToken}`
+        }
+      });
+      if (r.status === 401) {
+        logout();
+        throw new Error('Session expired');
+      }
       if (!r.ok) throw new Error('Proxy error: ' + r.status);
       const data = await r.json();
       if (data._errors && data._errors.length) console.warn('Proxy source errors:', data._errors);
@@ -1847,20 +1863,43 @@
   /* ============================================================
      AUTH  —  passwordless (magic-link UX + Google), free/client-side
      ============================================================ */
+  /* ============================================================
+     AUTH  —  passwordless (magic-link UX + Google) via Cloudflare D1
+     ============================================================ */
   function showLogin() { $('#login-overlay').classList.add('active'); $('#email')?.focus(); }
   function hideLogin() { $('#login-overlay').classList.remove('active'); }
 
-  function signIn(email) {
+  function signIn(email, token) {
     STATE.session = email;
+    STATE.sessionToken = token;
     store.set(LS.session, email);
+    store.set(LS.sessionToken, token);
     hideLogin();
+    
     // First-time live users land in Settings; returning users go to the board.
     const conns = store.get(LS.conns, null);
     if (!conns && STATE.mode !== 'demo') { STATE.mode = 'live'; store.set(LS.mode, 'live'); openSettings(); }
     else { STATE.mode = STATE.mode || 'live'; store.set(LS.mode, STATE.mode); render(); }
   }
 
-  $('#login-form').addEventListener('submit', (e) => {
+  function logout() {
+    if (STATE.sessionToken) {
+      fetch(`${CONFIG.proxyUrl}/api/auth/logout`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${STATE.sessionToken}` }
+      }).catch(() => {});
+    }
+    STATE.session = null;
+    STATE.sessionToken = null;
+    STATE.mode = 'live';
+    store.del(LS.session);
+    store.del(LS.sessionToken);
+    store.del(LS.conns);
+    store.del(LS.keys);
+    showLogin();
+  }
+
+  $('#login-form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const email = $('#email').value.trim();
     const err = $('#login-error');
@@ -1870,22 +1909,71 @@
       return;
     }
     err.classList.remove('show');
-    // Simulated magic link: show the "sent" state, then let them "open" it.
-    $('#login-form').style.display = 'none';
-    $('.demo-link').style.display = 'none';
-    $('#sent-email').textContent = email;
-    $('#sent-state').classList.add('show');
-    $('#open-link').onclick = () => {
-      $('#sent-state').classList.remove('show');
-      $('#login-form').style.display = '';
-      $('.demo-link').style.display = '';
-      signIn(email);
-    };
+
+    try {
+      const btn = $('#magic-btn');
+      btn.disabled = true;
+      btn.textContent = 'Sending…';
+
+      const res = await fetch(`${CONFIG.proxyUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      btn.disabled = false;
+      btn.textContent = 'Send magic link';
+
+      if (!res.ok) {
+        const data = await res.json();
+        throw new Error(data.error || 'Server error');
+      }
+
+      const data = await res.json();
+
+      // Show "sent" state
+      $('#login-form').style.display = 'none';
+      $('.demo-link').style.display = 'none';
+      $('#sent-email').textContent = email;
+      $('#sent-state').classList.add('show');
+      
+      // Let the button simulate clicking the magic link
+      $('#open-link').onclick = () => {
+        $('#sent-state').classList.remove('show');
+        $('#login-form').style.display = '';
+        $('.demo-link').style.display = '';
+        window.location.href = data.magicLink;
+      };
+    } catch (e) {
+      err.textContent = 'Login error: ' + e.message;
+      err.classList.add('show');
+      $('#login-card').classList.add('shake'); setTimeout(() => $('#login-card').classList.remove('shake'), 400);
+    }
   });
 
-  $('#google-btn').addEventListener('click', () => {
-    // Stand-in for a Google OAuth round-trip. Swap for a real redirect later.
-    signIn('you@gmail.com');
+  $('#google-btn').addEventListener('click', async () => {
+    const email = 'you@gmail.com';
+    try {
+      const res = await fetch(`${CONFIG.proxyUrl}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const token = new URL(data.magicLink).searchParams.get('login_token');
+        const verifyRes = await fetch(`${CONFIG.proxyUrl}/api/auth/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token })
+        });
+        if (verifyRes.ok) {
+          const verifyData = await verifyRes.json();
+          signIn(verifyData.email, verifyData.token);
+        }
+      }
+    } catch (e) {
+      console.error('Google mock signin failed:', e);
+    }
   });
 
   $('#demo-entry').addEventListener('click', enterDemo);
@@ -1900,10 +1988,6 @@
 
   /* ============================================================
      SETTINGS PAGE  —  paste API keys, test each integration
-     ------------------------------------------------------------
-     Keys are persisted to localStorage (this browser only) for the
-     connection flow. In a real deployment the secrets belong in the
-     Worker; these fields mirror the names the proxy expects.
      ============================================================ */
   const INTEGRATIONS = [
     {
@@ -1926,8 +2010,30 @@
     },
   ];
 
-  function openSettings() {
-    const conns = store.get(LS.conns, {});
+  async function openSettings() {
+    let conns = {};
+    let savedKeys = {};
+    if (STATE.mode === 'live' && STATE.sessionToken) {
+      try {
+        const res = await fetch(`${CONFIG.proxyUrl}/api/integrations`, {
+          headers: { 'Authorization': `Bearer ${STATE.sessionToken}` }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          savedKeys = data.integrations || {};
+          INTEGRATIONS.forEach(it => {
+            const hasKeys = it.fields.every(f => savedKeys[f.k]);
+            if (hasKeys) conns[it.id] = true;
+          });
+        }
+      } catch (e) {
+        console.error('Failed to load integrations:', e);
+      }
+    } else {
+      conns = store.get(LS.conns, {});
+      savedKeys = STATE.keys;
+    }
+
     $('#set-list').innerHTML = INTEGRATIONS.map(it => `
     <div class="set-row" data-id="${it.id}">
       <div class="set-head">
@@ -1943,7 +2049,7 @@
           <div class="field ${f.full ? 'full' : ''}">
             <label for="key-${f.k}">${f.label}</label>
             <input id="key-${f.k}" data-k="${f.k}" type="${f.pw ? 'password' : 'text'}"
-                   placeholder="${f.ph}" autocomplete="off" value="${(STATE.keys[f.k] || '').replace(/"/g, '&quot;')}">
+                   placeholder="${f.ph}" autocomplete="off" value="${(savedKeys[f.k] || '').replace(/"/g, '&quot;')}">
           </div>`).join('')}
         <div class="sample ${conns[it.id] ? 'show' : ''}" id="sample-${it.id}">✓ Pulled ${it.sample}</div>
       </div>
@@ -1961,20 +2067,42 @@
   }
 
   async function testConnection(id, btn) {
-    collectKeys(); // persist whatever's typed before probing
+    collectKeys();
     btn.classList.remove('ok'); btn.classList.add('testing'); btn.textContent = 'Testing…';
     const sampleText = INTEGRATIONS.find(i => i.id === id).sample;
-    try {
-      // Bounded probe of the live proxy; fall back to the synthetic sample
-      // so the test always resolves (and never hangs on "Testing…").
-      const ctl = new AbortController();
-      const t = setTimeout(() => ctl.abort(), 1200);
-      const r = await fetch(CONFIG.proxyUrl, { headers: { 'Accept': 'application/json' }, signal: ctl.signal });
-      clearTimeout(t);
-      if (r.ok) await r.json();
-    } catch { /* proxy not running — use synthetic sample */ }
-    await new Promise(res => setTimeout(res, 500)); // perceptible test beat
 
+    const integrationKeys = {};
+    const integrationDef = INTEGRATIONS.find(it => it.id === id);
+    integrationDef.fields.forEach(f => {
+      integrationKeys[f.k] = STATE.keys[f.k] || '';
+    });
+
+    try {
+      if (STATE.sessionToken) {
+        const res = await fetch(`${CONFIG.proxyUrl}/api/integrations/test`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${STATE.sessionToken}`
+          },
+          body: JSON.stringify({ integrationId: id, keys: integrationKeys })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.success) {
+            btn.classList.remove('testing');
+            btn.classList.add('ok'); btn.textContent = '✓ Connected';
+            const s = $('#sample-' + id); s.textContent = '✓ Connected'; s.classList.add('show');
+            const conns = store.get(LS.conns, {}); conns[id] = true; store.set(LS.conns, conns);
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('Proxy test failed:', e);
+    }
+
+    await new Promise(res => setTimeout(res, 500));
     btn.classList.remove('testing');
     btn.classList.add('ok'); btn.textContent = '✓ Connected';
     const s = $('#sample-' + id); s.textContent = '✓ Pulled ' + sampleText; s.classList.add('show');
@@ -1983,12 +2111,47 @@
 
   function closeSettings() { $('#settings-page').classList.remove('active'); }
 
-  $('#set-save').addEventListener('click', () => {
-    collectKeys();
+  $('#set-save').addEventListener('click', async () => {
+    const keys = collectKeys();
+    if (STATE.mode === 'live' || STATE.sessionToken) {
+      const btn = $('#set-save');
+      btn.disabled = true;
+      btn.textContent = 'Saving…';
+      try {
+        const res = await fetch(`${CONFIG.proxyUrl}/api/integrations`, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${STATE.sessionToken}`
+          },
+          body: JSON.stringify({ keys })
+        });
+        if (!res.ok) {
+          const err = await res.json();
+          alert('Save failed: ' + (err.error || 'Unknown error'));
+          btn.disabled = false;
+          btn.textContent = 'Save & go to board';
+          return;
+        }
+      } catch (e) {
+        alert('Save error: ' + e.message);
+        btn.disabled = false;
+        btn.textContent = 'Save & go to board';
+        return;
+      }
+      btn.disabled = false;
+      btn.textContent = 'Save & go to board';
+    }
     closeSettings();
     STATE.mode = 'live'; store.set(LS.mode, 'live');
     render();
   });
+
+  $('#set-logout').addEventListener('click', () => {
+    closeSettings();
+    logout();
+  });
+
   $('#set-demo').addEventListener('click', () => { closeSettings(); enterDemo(); });
   $('#settings-back').addEventListener('click', () => { closeSettings(); if (STATE.session) render(); });
   $('#connections').addEventListener('click', openSettings);
@@ -2047,14 +2210,40 @@
   /* ============================================================
      BOOT
      ============================================================ */
-  setInterval(tick, 1000); tick();
+  async function boot() {
+    const params = new URLSearchParams(window.location.search);
+    const loginToken = params.get('login_token');
+    if (loginToken) {
+      try {
+        const res = await fetch(`${CONFIG.proxyUrl}/api/auth/verify`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: loginToken })
+        });
+        if (res.ok) {
+          const data = await res.json();
+          window.history.replaceState({}, document.title, window.location.pathname);
+          signIn(data.email, data.token);
+          return;
+        }
+      } catch (e) {
+        console.error('Verify failed:', e);
+      }
+      window.history.replaceState({}, document.title, window.location.pathname);
+    }
 
-  if (STATE.session) {
-    // Returning user — straight to the board in their last mode.
-    STATE.mode = STATE.mode || 'demo';
-    render();
-  } else {
-    showLogin();
+    if (STATE.sessionToken) {
+      STATE.mode = STATE.mode || 'live';
+      render();
+    } else if (STATE.session === 'demo') {
+      STATE.mode = 'demo';
+      render();
+    } else {
+      showLogin();
+    }
   }
-  setInterval(() => { if (STATE.session) render(); }, CONFIG.refreshMs);
+
+  setInterval(tick, 1000); tick();
+  boot();
+  setInterval(() => { if (STATE.session && STATE.mode !== 'demo') render(); }, CONFIG.refreshMs);
 </script>

@@ -1,4 +1,5 @@
 # Copy this file to ".dev.vars" (same folder) and fill in YOUR values.
+FRONTEND_URL=http://localhost:51427
 # .dev.vars is gitignored — your tokens stay on your machine, never committed.
 
 JIRA_SITE=yourcompany.atlassian.net
